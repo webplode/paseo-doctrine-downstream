@@ -44,7 +44,7 @@ These count source files, excluding tests and the `policy/` directory. All repro
 | Metric                                             | Value |
 | -------------------------------------------------- | ----- |
 | COMPAT tags total                                  | 432   |
-| COMPAT tags with no removal date and no condition  | 66    |
+| COMPAT tags with no removal date and no condition  | 60    |
 | Role literals in the kernel, outside `policy/`     | 53    |
 | Kernel files containing a role literal             | 9     |
 | Files outside `policy/` depending on `PaseoRoleId` | 35    |

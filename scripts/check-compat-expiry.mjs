@@ -18,11 +18,18 @@ const BASELINE_URL = new URL("./compat-expiry-baseline.json", import.meta.url);
 const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mjs|cjs|js|jsx)$/u;
 const TAG_PATTERN = /COMPAT\(([^)\s]+)\)/gu;
 const COMMENT_CONTINUATION = /^(?:\/\/|\*|\/\*)/u;
-const REMOVAL_DATE = /\d{4}-\d{2}-\d{2}/u;
-const REMOVAL_CONDITION =
-  /\b(?:remove|removed|removal|delete|drop|retire|unpin|collapse)\b[^.;]{0,120}?\b(?:after|when|once|until|as soon as)\b/iu;
-// A line that points at a tag defined elsewhere is a cross-reference, not a tag site.
-const CROSS_REFERENCE = /\b(?:see|per|matches|mirrors|paired with|companion to)\s+COMPAT\(/iu;
+
+// A bare date is not a removal plan. `added 2026-06-11` says when the shim arrived, not
+// when it goes. The date only counts when a deadline preposition governs it.
+const DEADLINE = /\b(?:after|until|through|by)\b[^.;]{0,40}?\d{4}-\d{2}-\d{2}/iu;
+// Or the tag names the condition that ends it, with no date at all.
+const CONDITION =
+  /\b(?:remove|removed|removal|delete|deleted|drop|dropped|retire|stop|unpin|collapse|keep|kept)\b[\s\S]{0,160}?\b(?:once|when|as soon as|after|until|through)\b/iu;
+
+// `see COMPAT(other)` points at a tag defined elsewhere. Matched against the text
+// immediately before one occurrence, so a real tag on the same line still counts.
+const CROSS_REFERENCE_LEAD = /\b(?:see|per|matches|mirrors|paired with|companion to)\s+$/iu;
+
 // This checker and its tests carry COMPAT-shaped literals and fixtures on purpose.
 const SELF_EXCLUDED = new Set([
   "scripts/check-compat-expiry.mjs",
@@ -30,11 +37,7 @@ const SELF_EXCLUDED = new Set([
 ]);
 
 export function hasRemovalPlan(block) {
-  return REMOVAL_DATE.test(block) || REMOVAL_CONDITION.test(block);
-}
-
-export function isCrossReference(line) {
-  return CROSS_REFERENCE.test(line);
+  return DEADLINE.test(block) || CONDITION.test(block);
 }
 
 /** Collect the tag line plus the comment lines that continue it. */
@@ -44,31 +47,49 @@ export function commentBlockAt(lines, index, maxLookahead = 6) {
   for (let cursor = index + 1; cursor < limit; cursor++) {
     const trimmed = (lines[cursor] ?? "").trim();
     if (!COMMENT_CONTINUATION.test(trimmed)) break;
-    if (TAG_PATTERN.test(trimmed)) {
-      TAG_PATTERN.lastIndex = 0;
-      break;
-    }
-    TAG_PATTERN.lastIndex = 0;
+    if (trimmed.includes("COMPAT(")) break;
     block += ` ${trimmed}`;
   }
   return block;
 }
 
+/** Tag occurrences on one line, minus the ones that only point at a tag defined elsewhere. */
+export function tagNamesOnLine(line) {
+  const names = [];
+  TAG_PATTERN.lastIndex = 0;
+  let found = TAG_PATTERN.exec(line);
+  while (found !== null) {
+    if (!CROSS_REFERENCE_LEAD.test(line.slice(0, found.index))) names.push(found[1]);
+    found = TAG_PATTERN.exec(line);
+  }
+  return names;
+}
+
 /** Every COMPAT tag site in one file that lacks a removal date or condition. */
 export function findUndatedTags(filePath, contents) {
   const lines = contents.split("\n");
+  // Same-name tags repeat legitimately in one file, so identity needs an occurrence
+  // ordinal. Without it a second undated occurrence inherits the first one's baseline
+  // entry and passes unnoticed.
+  const seen = new Map();
   const found = [];
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
     if (!line.includes("COMPAT(")) continue;
-    if (isCrossReference(line)) continue;
-    TAG_PATTERN.lastIndex = 0;
-    const names = [...line.matchAll(TAG_PATTERN)].map((match) => match[1]);
+    const names = tagNamesOnLine(line);
     if (names.length === 0) continue;
     const block = commentBlockAt(lines, index);
-    if (hasRemovalPlan(block)) continue;
+    const planned = hasRemovalPlan(block);
     for (const name of names) {
-      found.push({ key: `${filePath}::${name}`, file: filePath, line: index + 1, name });
+      const ordinal = seen.get(name) ?? 0;
+      seen.set(name, ordinal + 1);
+      if (planned) continue;
+      found.push({
+        key: `${filePath}::${name}#${ordinal}`,
+        file: filePath,
+        line: index + 1,
+        name,
+      });
     }
   }
   return found;
@@ -95,12 +116,12 @@ export function collectUndatedTags(files = trackedSourceFiles()) {
   return found.sort((left, right) => left.key.localeCompare(right.key));
 }
 
-function readBaseline() {
+export function readBaseline() {
   try {
     const parsed = JSON.parse(readFileSync(BASELINE_URL, "utf8"));
-    return Array.isArray(parsed.tags) ? parsed.tags : [];
+    return Array.isArray(parsed.tags) ? parsed.tags : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -114,25 +135,48 @@ function writeBaseline(keys) {
   writeFileSync(BASELINE_URL, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
+function runUpdate(keys) {
+  const baseline = readBaseline();
+  if (baseline === null) {
+    writeBaseline(keys);
+    console.log(`Created baseline with ${keys.length} COMPAT tag(s).`);
+    return;
+  }
+  // --update must never launder a new tag into the baseline. It only drops entries that
+  // gained a removal plan or disappeared.
+  const known = new Set(baseline);
+  const added = keys.filter((key) => !known.has(key));
+  if (added.length > 0) {
+    console.error(
+      `${added.length} COMPAT tag(s) are not in the baseline and cannot be added to it.\n` +
+        "Give each one a removal date or condition instead.\n",
+    );
+    for (const key of added) console.error(`  ${key}`);
+    process.exitCode = 1;
+    return;
+  }
+  writeBaseline(keys);
+  console.log(`Baseline shrank from ${baseline.length} to ${keys.length} COMPAT tag(s).`);
+}
+
 function main() {
-  const update = process.argv.includes("--update");
   const undated = collectUndatedTags();
   const keys = undated.map((tag) => tag.key);
 
-  if (update) {
-    writeBaseline(keys);
-    console.log(`Wrote ${keys.length} baseline COMPAT tags to ${fileURLToPath(BASELINE_URL)}`);
+  if (process.argv.includes("--update")) {
+    runUpdate(keys);
     return;
   }
 
-  const baseline = new Set(readBaseline());
-  const added = undated.filter((tag) => !baseline.has(tag.key));
-  const removed = [...baseline].filter((key) => !keys.includes(key));
+  const baseline = readBaseline() ?? [];
+  const known = new Set(baseline);
+  const added = undated.filter((tag) => !known.has(tag.key));
+  const removed = baseline.filter((key) => !keys.includes(key));
 
   if (added.length > 0) {
     console.error(
       `${added.length} COMPAT tag(s) carry no removal date and no removal condition.\n` +
-        "docs/protocol-compatibility.md: give the tag a name, a version, and a removal date or condition.\n",
+        "docs/protocol-compatibility.md: give the tag a name, a version, and a removal plan.\n",
     );
     for (const tag of added) console.error(`  ${tag.file}:${tag.line}  COMPAT(${tag.name})`);
     process.exitCode = 1;
