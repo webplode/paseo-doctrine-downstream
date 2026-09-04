@@ -3,24 +3,47 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  baselineTotal,
   collectUndatedTags,
   commentBlockAt,
+  countByKey,
   findUndatedTags,
   hasRemovalPlan,
   readBaseline,
   tagNamesOnLine,
 } from "./check-compat-expiry.mjs";
 
-test("a removal deadline satisfies the rule", () => {
-  assert.ok(hasRemovalPlan("// COMPAT(x): added in v0.2.0, remove after 2027-01-18."));
-  assert.ok(hasRemovalPlan("// COMPAT(x): keep legacy configs parseable until 2026-12-31."));
-  assert.ok(hasRemovalPlan("// COMPAT(x): accept peers that observed v0.2.6 through 2027-01-31."));
+const tag = (text) => `// COMPAT(x): ${text}.`;
+
+test("a removal verb with a deadline satisfies the rule", () => {
+  assert.ok(hasRemovalPlan(tag("added in v0.2.0, remove after 2027-01-18")));
+  assert.ok(hasRemovalPlan(tag("Stop emitting it after 2027-01-17 once clients update")));
+  assert.ok(hasRemovalPlan(tag("drop the gate when the floor is >= v0.1.48")));
 });
 
-test("a removal condition satisfies the rule without a date", () => {
-  assert.ok(hasRemovalPlan("// COMPAT(x): remove once the daemon floor reaches v0.4.0."));
-  assert.ok(hasRemovalPlan("// COMPAT(x): delete when the old wire shape is gone."));
-  assert.ok(hasRemovalPlan("// COMPAT(x): keep optional until the daemon floor is v0.2.4."));
+test("until ends the shim whatever verb carries it", () => {
+  assert.ok(hasRemovalPlan(tag("keep legacy paseo.json parseable until 2026-12-31")));
+  assert.ok(
+    hasRemovalPlan(tag("replay reconstructed rows to legacy clients until the floor is v0.5.0")),
+  );
+  assert.ok(hasRemovalPlan(tag("keep optional until the daemon floor is v0.2.4")));
+});
+
+test("a retention verb with after is not a removal plan", () => {
+  // `keep this shim after X` says the shim survives X. Only `until` and `through`
+  // bound a retention clause, so pairing retention with `after` must not pass.
+  assert.equal(hasRemovalPlan(tag("keep this shim after the daemon floor reaches v1")), false);
+  assert.equal(hasRemovalPlan(tag("support the legacy shape after v1 ships")), false);
+});
+
+test("a date that is not a removal date does not satisfy the rule", () => {
+  // `added 2026-09-01` says when the shim arrived, not when it goes.
+  assert.equal(hasRemovalPlan(tag("introduced 2026-09-01; old clients need this")), false);
+  assert.equal(hasRemovalPlan(tag("ships alongside providers (v0.1.48, 2026-04-05)")), false);
+});
+
+test("a bare description satisfies neither", () => {
+  assert.equal(hasRemovalPlan(tag("old daemons omit assignments")), false);
 });
 
 test("a removal condition may span a sentence boundary", () => {
@@ -32,22 +55,6 @@ test("a removal condition may span a sentence boundary", () => {
         ".optional() in messages.ts when the client floor is high enough.",
     ),
   );
-});
-
-test("a date that is not a removal date does not satisfy the rule", () => {
-  // `added 2026-09-01` says when the shim arrived, not when it goes.
-  assert.equal(
-    hasRemovalPlan("// COMPAT(x): introduced 2026-09-01; old clients need this."),
-    false,
-  );
-  assert.equal(
-    hasRemovalPlan("// COMPAT(x): ships alongside providers (v0.1.48, 2026-04-05)."),
-    false,
-  );
-});
-
-test("a bare description satisfies neither", () => {
-  assert.equal(hasRemovalPlan("// COMPAT(x): old daemons omit assignments."), false);
 });
 
 test("a cross-reference alone is not a tag site", () => {
@@ -89,44 +96,45 @@ test("findUndatedTags reports the undated tag and skips the planned one", () => 
   ].join("\n");
   const found = findUndatedTags("packages/example/src/thing.ts", contents);
   assert.deepEqual(
-    found.map((tag) => tag.name),
+    found.map((entry) => entry.name),
     ["undated"],
   );
   assert.equal(found[0].line, 3);
-  assert.equal(found[0].key, "packages/example/src/thing.ts::undated#0");
+  assert.equal(found[0].key, "packages/example/src/thing.ts::undated");
 });
 
-test("repeated names in one file get distinct identities", () => {
-  // A shared `path::name` key let a second undated occurrence inherit the first one's
-  // baseline entry and pass unnoticed.
+test("repeated undated names in one file raise the count, not the key", () => {
+  // A per-name count catches a second undated occurrence without giving the tag a
+  // positional identity.
   const contents = [
     "// COMPAT(shared): old clients omit this.",
     "const a = 1;",
     "// COMPAT(shared): a different site, also undated.",
   ].join("\n");
-  const keys = findUndatedTags("packages/example/src/thing.ts", contents).map((tag) => tag.key);
-  assert.deepEqual(keys, [
-    "packages/example/src/thing.ts::shared#0",
-    "packages/example/src/thing.ts::shared#1",
-  ]);
+  const counts = countByKey(findUndatedTags("packages/example/src/thing.ts", contents));
+  assert.equal(counts.get("packages/example/src/thing.ts::shared"), 2);
 });
 
-test("an occurrence ordinal counts planned siblings too", () => {
-  // Giving one occurrence a removal plan must not renumber the others, or every
-  // baseline entry after it would stop matching.
-  const contents = [
-    "// COMPAT(shared): remove after 2027-01-01.",
+test("adding or removing a planned sibling does not move the identity", () => {
+  // A positional ordinal deadlocked here: adding a planned sibling renumbered the
+  // undated tag, the check reported one addition and one removal, and --update refused
+  // the new key. The count has to stay put so the baseline still matches.
+  const withoutSibling = ["// COMPAT(shared): still undated."].join("\n");
+  const withSibling = [
+    "// COMPAT(shared): a planned sibling, remove after 2027-01-01.",
     "const a = 1;",
     "// COMPAT(shared): still undated.",
   ].join("\n");
-  const keys = findUndatedTags("packages/example/src/thing.ts", contents).map((tag) => tag.key);
-  assert.deepEqual(keys, ["packages/example/src/thing.ts::shared#1"]);
+  const before = countByKey(findUndatedTags("packages/example/src/thing.ts", withoutSibling));
+  const after = countByKey(findUndatedTags("packages/example/src/thing.ts", withSibling));
+  assert.deepEqual([...after], [...before]);
+  assert.equal(after.get("packages/example/src/thing.ts::shared"), 1);
 });
 
 test("the checker does not scan itself or its own fixtures", () => {
   // Both files carry COMPAT-shaped literals and test fixtures. Before this exclusion the
   // gate reported its own strings the moment the files became tracked.
-  const scanned = new Set(collectUndatedTags().map((tag) => tag.file));
+  const scanned = new Set(collectUndatedTags().map((entry) => entry.file));
   assert.equal(scanned.has("scripts/check-compat-expiry.mjs"), false);
   assert.equal(scanned.has("scripts/check-compat-expiry.test.mjs"), false);
 });
@@ -136,29 +144,34 @@ test("the checked-in baseline matches the repository exactly", () => {
   // removal date or condition, or a tag was fixed and the baseline must shrink:
   // npm run compat:expiry:update
   const baseline = readBaseline();
-  const actual = collectUndatedTags().map((tag) => tag.key);
-  assert.deepEqual(actual, baseline);
+  const counts = countByKey(collectUndatedTags());
+  assert.deepEqual(
+    Object.fromEntries([...counts].sort(([a], [b]) => a.localeCompare(b))),
+    baseline,
+  );
 });
 
 test("the baseline only shrinks", () => {
   // Recorded so a future edit that grows the baseline has to change this number and
   // explain why. Drop the baseline entirely when it reaches zero.
-  const baseline = readBaseline();
+  const total = baselineTotal(readBaseline());
   assert.ok(
-    baseline.length <= 60,
-    `baseline grew to ${baseline.length}; give the new tag a removal date or condition instead`,
+    total <= 60,
+    `baseline grew to ${total}; give the new tag a removal date or condition instead`,
   );
 });
 
-test("every baseline entry is unique", () => {
+test("every baseline count is a positive integer", () => {
   const baseline = readBaseline();
-  assert.equal(new Set(baseline).size, baseline.length);
+  for (const [key, count] of Object.entries(baseline)) {
+    assert.ok(Number.isInteger(count) && count > 0, `${key} has a bad count: ${count}`);
+  }
 });
 
-test("the baseline file parses and is an array of strings", () => {
+test("the baseline file parses and keys look like path::name", () => {
   const parsed = JSON.parse(
     readFileSync(new URL("./compat-expiry-baseline.json", import.meta.url)),
   );
-  assert.ok(Array.isArray(parsed.tags));
-  assert.ok(parsed.tags.every((entry) => typeof entry === "string"));
+  assert.equal(typeof parsed.tags, "object");
+  for (const key of Object.keys(parsed.tags)) assert.match(key, /^[^:]+::[^:]+$/u);
 });

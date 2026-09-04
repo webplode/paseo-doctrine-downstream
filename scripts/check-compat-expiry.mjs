@@ -19,12 +19,16 @@ const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mjs|cjs|js|jsx)$/u;
 const TAG_PATTERN = /COMPAT\(([^)\s]+)\)/gu;
 const COMMENT_CONTINUATION = /^(?:\/\/|\*|\/\*)/u;
 
-// A bare date is not a removal plan. `added 2026-06-11` says when the shim arrived, not
-// when it goes. The date only counts when a deadline preposition governs it.
-const DEADLINE = /\b(?:after|until|through|by)\b[^.;]{0,40}?\d{4}-\d{2}-\d{2}/iu;
-// Or the tag names the condition that ends it, with no date at all.
-const CONDITION =
-  /\b(?:remove|removed|removal|delete|deleted|drop|dropped|retire|stop|unpin|collapse|keep|kept)\b[\s\S]{0,160}?\b(?:once|when|as soon as|after|until|through)\b/iu;
+// Removing the shim at or after some point. Any of these prepositions works.
+const REMOVAL_CLAUSE =
+  /\b(?:remove|removed|removal|delete|deleted|drop|dropped|retire|retired|stop|unpin|collapse)\b[\s\S]{0,160}?\b(?:after|when|once|until|through|as soon as)\b/iu;
+// `until` marks the end of the shim's life on its own, whatever verb carries it:
+// `keep parseable until X`, `replay rows to legacy clients until X`. Deliberately not
+// `after`, because `keep this shim after X` says the shim survives X rather than ending.
+const ENDS_AT = /\buntil\b/iu;
+// A bare deadline with a real date, with no verb needed. A date alone is not a removal
+// plan, so `added 2026-06-11` must not qualify.
+const BARE_DEADLINE = /\b(?:through|by)\b[^.;]{0,40}?\d{4}-\d{2}-\d{2}/iu;
 
 // `see COMPAT(other)` points at a tag defined elsewhere. Matched against the text
 // immediately before one occurrence, so a real tag on the same line still counts.
@@ -37,7 +41,7 @@ const SELF_EXCLUDED = new Set([
 ]);
 
 export function hasRemovalPlan(block) {
-  return DEADLINE.test(block) || CONDITION.test(block);
+  return REMOVAL_CLAUSE.test(block) || ENDS_AT.test(block) || BARE_DEADLINE.test(block);
 }
 
 /** Collect the tag line plus the comment lines that continue it. */
@@ -68,28 +72,15 @@ export function tagNamesOnLine(line) {
 /** Every COMPAT tag site in one file that lacks a removal date or condition. */
 export function findUndatedTags(filePath, contents) {
   const lines = contents.split("\n");
-  // Same-name tags repeat legitimately in one file, so identity needs an occurrence
-  // ordinal. Without it a second undated occurrence inherits the first one's baseline
-  // entry and passes unnoticed.
-  const seen = new Map();
   const found = [];
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
     if (!line.includes("COMPAT(")) continue;
     const names = tagNamesOnLine(line);
     if (names.length === 0) continue;
-    const block = commentBlockAt(lines, index);
-    const planned = hasRemovalPlan(block);
+    if (hasRemovalPlan(commentBlockAt(lines, index))) continue;
     for (const name of names) {
-      const ordinal = seen.get(name) ?? 0;
-      seen.set(name, ordinal + 1);
-      if (planned) continue;
-      found.push({
-        key: `${filePath}::${name}#${ordinal}`,
-        file: filePath,
-        line: index + 1,
-        name,
-      });
+      found.push({ key: `${filePath}::${name}`, file: filePath, line: index + 1, name });
     }
   }
   return found;
@@ -113,86 +104,120 @@ export function collectUndatedTags(files = trackedSourceFiles()) {
     if (!contents.includes("COMPAT(")) continue;
     found.push(...findUndatedTags(file, contents));
   }
-  return found.sort((left, right) => left.key.localeCompare(right.key));
+  return found.sort((left, right) => left.key.localeCompare(right.key) || left.line - right.line);
+}
+
+/**
+ * Baseline entries count undated tags per file and name, never per position.
+ *
+ * A positional identity looks tidy and deadlocks the repo: adding or removing a sibling
+ * occurrence renumbers a baselined tag, the check reports one addition and one removal,
+ * and --update refuses the new key because it is not in the baseline. Counts move only
+ * when the amount of undated debt moves, which is the thing being gated.
+ */
+export function countByKey(tags) {
+  const counts = new Map();
+  for (const tag of tags) counts.set(tag.key, (counts.get(tag.key) ?? 0) + 1);
+  return counts;
 }
 
 export function readBaseline() {
   try {
     const parsed = JSON.parse(readFileSync(BASELINE_URL, "utf8"));
-    return Array.isArray(parsed.tags) ? parsed.tags : null;
+    return parsed.tags && typeof parsed.tags === "object" ? parsed.tags : null;
   } catch {
     return null;
   }
 }
 
-function writeBaseline(keys) {
+export function baselineTotal(baseline) {
+  return Object.values(baseline).reduce((sum, count) => sum + count, 0);
+}
+
+function writeBaseline(counts) {
+  const tags = Object.fromEntries([...counts].sort(([a], [b]) => a.localeCompare(b)));
   const payload = {
     comment:
-      "COMPAT tags that predate scripts/check-compat-expiry.mjs. Only shrinks. " +
-      "Give a tag a removal date or condition, then remove its entry.",
-    tags: keys,
+      "Undated COMPAT tags per file and name that predate scripts/check-compat-expiry.mjs. " +
+      "Counts only shrink. Give a tag a removal date or condition, then run compat:expiry:update.",
+    tags,
   };
   writeFileSync(BASELINE_URL, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
 
-function runUpdate(keys) {
+/** Keys whose current count exceeds what the baseline allows. */
+function exceedances(counts, baseline) {
+  const over = [];
+  for (const [key, count] of counts) {
+    const allowed = baseline[key] ?? 0;
+    if (count > allowed) over.push({ key, count, allowed });
+  }
+  return over.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+function runUpdate(counts) {
   const baseline = readBaseline();
   if (baseline === null) {
-    writeBaseline(keys);
-    console.log(`Created baseline with ${keys.length} COMPAT tag(s).`);
+    writeBaseline(counts);
+    console.log(`Created baseline with ${[...counts.values()].reduce((a, b) => a + b, 0)} tag(s).`);
     return;
   }
-  // --update must never launder a new tag into the baseline. It only drops entries that
-  // gained a removal plan or disappeared.
-  const known = new Set(baseline);
-  const added = keys.filter((key) => !known.has(key));
-  if (added.length > 0) {
+  // --update must never launder new debt into the baseline. It only lowers counts.
+  const over = exceedances(counts, baseline);
+  if (over.length > 0) {
     console.error(
-      `${added.length} COMPAT tag(s) are not in the baseline and cannot be added to it.\n` +
-        "Give each one a removal date or condition instead.\n",
+      `${over.length} COMPAT tag name(s) have more undated occurrences than the baseline allows.\n` +
+        "Give each new one a removal date or condition instead.\n",
     );
-    for (const key of added) console.error(`  ${key}`);
+    for (const item of over) console.error(`  ${item.key}: ${item.count} > ${item.allowed}`);
     process.exitCode = 1;
     return;
   }
-  writeBaseline(keys);
-  console.log(`Baseline shrank from ${baseline.length} to ${keys.length} COMPAT tag(s).`);
+  const before = baselineTotal(baseline);
+  writeBaseline(counts);
+  const after = [...counts.values()].reduce((sum, count) => sum + count, 0);
+  console.log(`Baseline shrank from ${before} to ${after} undated COMPAT tag(s).`);
 }
 
 function main() {
   const undated = collectUndatedTags();
-  const keys = undated.map((tag) => tag.key);
+  const counts = countByKey(undated);
 
   if (process.argv.includes("--update")) {
-    runUpdate(keys);
+    runUpdate(counts);
     return;
   }
 
-  const baseline = readBaseline() ?? [];
-  const known = new Set(baseline);
-  const added = undated.filter((tag) => !known.has(tag.key));
-  const removed = baseline.filter((key) => !keys.includes(key));
+  const baseline = readBaseline() ?? {};
+  const over = exceedances(counts, baseline);
+  const stale = Object.keys(baseline).filter((key) => (counts.get(key) ?? 0) < baseline[key]);
 
-  if (added.length > 0) {
+  if (over.length > 0) {
+    const sites = new Map(
+      undated.map((tag) => [tag.key, undated.filter((t) => t.key === tag.key)]),
+    );
     console.error(
-      `${added.length} COMPAT tag(s) carry no removal date and no removal condition.\n` +
+      `${over.length} COMPAT tag name(s) carry more undated occurrences than the baseline allows.\n` +
         "docs/protocol-compatibility.md: give the tag a name, a version, and a removal plan.\n",
     );
-    for (const tag of added) console.error(`  ${tag.file}:${tag.line}  COMPAT(${tag.name})`);
+    for (const item of over) {
+      console.error(`  ${item.key}  (${item.count} undated, baseline allows ${item.allowed})`);
+      for (const site of sites.get(item.key) ?? []) console.error(`    ${site.file}:${site.line}`);
+    }
     process.exitCode = 1;
   }
 
-  if (removed.length > 0) {
+  if (stale.length > 0) {
     console.error(
-      `\n${removed.length} baseline COMPAT tag(s) no longer match.\n` +
+      `\n${stale.length} baseline entr(y|ies) now cover fewer tags.\n` +
         "Run 'npm run compat:expiry:update' to shrink the baseline.\n",
     );
-    for (const key of removed) console.error(`  ${key}`);
+    for (const key of stale) console.error(`  ${key}: ${counts.get(key) ?? 0} < ${baseline[key]}`);
     process.exitCode = 1;
   }
 
   if (process.exitCode !== 1) {
-    console.log(`COMPAT expiry gate: ${keys.length} baseline tag(s), no new undated tags.`);
+    console.log(`COMPAT expiry gate: ${undated.length} baseline tag(s), no new undated tags.`);
   }
 }
 

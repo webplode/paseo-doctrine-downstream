@@ -54,7 +54,7 @@ A shim that exists for old-app or old-daemon support carries a comment naming it
 
 When a tag's condition is met, delete the shim and the tag in the same change.
 
-`npm run compat:expiry:check` fails on a tag that has neither a removal date nor a removal condition. Tags that predate the check are listed in `scripts/compat-expiry-baseline.json`; the list only shrinks. When you give a baselined tag a removal plan, run `npm run compat:expiry:update` in the same change. Drop the baseline and the flag once it reaches zero. For what else the doctrine does and does not enforce, see [doctrine-enforcement-gaps.md](doctrine-enforcement-gaps.md).
+`npm run compat:expiry:check` fails on a tag that has neither a removal date nor a removal condition. A date only counts when a deadline preposition governs it, so `added 2026-06-11` does not qualify on its own. Tags that predate the check are counted per file and name in `scripts/compat-expiry-baseline.json`, and those counts only shrink. When you give a baselined tag a removal plan, run `npm run compat:expiry:update` in the same change. Drop the baseline and the flag once it reaches zero. For what else the doctrine does and does not enforce, see [doctrine-enforcement-gaps.md](doctrine-enforcement-gaps.md).
 
 ## QA
 
