@@ -85,6 +85,8 @@
     "acp:version-drift:check": "node scripts/check-acp-catalog-version-drift.mjs --fail-on-drift",
     "acp:version-drift:update": "node scripts/check-acp-catalog-version-drift.mjs --update",
     "acp:pin-consistency:check": "node scripts/check-acp-catalog-version-drift.mjs --no-network --fail-on-drift",
+    "compat:expiry:check": "node scripts/check-compat-expiry.mjs",
+    "compat:expiry:update": "node scripts/check-compat-expiry.mjs --update",
     "start": "npm run start --workspace=@getpaseo/server",
     "android": "npm run android --workspace=@getpaseo/app",
     "android:development": "npm run android:development --workspace=@getpaseo/app",
